@@ -2,10 +2,11 @@ import asyncio
 import random
 import time
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, BackgroundTasks, Query
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse
-from playwright.async_api import async_playwright
-from bs4 import BeautifulSoup  # Still for proxy scraping
+from playwright.async_api import async_playwright, Error
+import aiohttp
+from bs4 import BeautifulSoup
 
 TARGET_URL = "https://shy.bio/67"
 
@@ -14,73 +15,104 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(continuous_browser_hammer())
     yield
 
-app = FastAPI(title="Browser Auto-Hammer - shy.bio/67", lifespan=lifespan)
+app = FastAPI(title="Robust Browser Hammer shy.bio/67", lifespan=lifespan)
 
 async def scrape_open_proxies() -> list:
     proxies = []
-    sources = ["https://www.sslproxies.org/", "https://free-proxy-list.net/", "https://www.us-proxy.org/"]
-    async with async_playwright() as p:  # Reuse for scraping if wanted, but simple aiohttp fallback omitted for brevity
-        # ... (keep similar scraping logic, or simplify)
-        pass  # Implement as before or extend
-    # Placeholder - fill with your previous scrape logic returning http://ip:port
-    return ["http://example-proxy:8080"] * 50  # Replace with real scrape
+    sources = ["https://www.sslproxies.org/", "https://free-proxy-list.net/"]
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        for url in sources:
+            try:
+                async with session.get(url, timeout=20) as resp:
+                    if resp.status == 200:
+                        soup = BeautifulSoup(await resp.text(), 'html.parser')
+                        table = soup.find('table')
+                        if table:
+                            for row in table.find_all('tr')[1:120]:
+                                cols = row.find_all('td')
+                                if len(cols) >= 2:
+                                    ip = cols[0].text.strip()
+                                    port = cols[1].text.strip()
+                                    if ip and port and '.' in ip:
+                                        proxies.append(f"http://{ip}:{port}")
+            except:
+                continue
+    proxies = list(set(proxies))
+    random.shuffle(proxies)
+    return proxies[:300]
+
+async def attempt_browser_visit(proxy_str: str):
+    try:
+        async with async_playwright() as p:
+            proxy_config = {"server": proxy_str}
+            browser = await p.chromium.launch(
+                headless=True,
+                proxy=proxy_config,
+                args=[
+                    '--no-sandbox', '--disable-setuid-sandbox', 
+                    '--disable-dev-shm-usage', '--disable-gpu',
+                    '--single-process', '--no-zygote'
+                ]
+            )
+            context = await browser.new_context(
+                viewport={'width': 1280, 'height': 720},
+                user_agent=random.choice([
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+                ])
+            )
+            page = await context.new_page()
+            
+            await page.goto(TARGET_URL, wait_until='networkidle', timeout=60000)
+            await page.wait_for_load_state('domcontentloaded')
+            await asyncio.sleep(random.uniform(2, 5))
+            
+            try:
+                await page.locator('button, a, text=/click to enter/i, [role="button"]').first.click(timeout=20000)
+                print(f"✅ SUCCESS Click on {TARGET_URL} via {proxy_str}")
+            except:
+                print(f"Click skipped/fallback on {proxy_str}")
+            
+            await browser.close()
+            return True
+    except Exception as e:
+        print(f"Browser fail {proxy_str}: {str(e)[:150]}")
+        return False
 
 async def browser_hammer_cycle():
     proxies = await scrape_open_proxies()
     if not proxies:
-        await asyncio.sleep(30)
+        print("No proxies - sleeping...")
+        await asyncio.sleep(45)
         return
 
-    async with async_playwright() as p:
-        for proxy_str in proxies:
+    for proxy_str in proxies:
+        success = await attempt_browser_visit(proxy_str)
+        if not success:
+            # Lightweight HTTP fallback for dead proxies
             try:
-                proxy_config = {"server": proxy_str}
-                browser = await p.chromium.launch(
-                    headless=True,
-                    proxy=proxy_config,
-                    args=['--no-sandbox', '--disable-setuid-sandbox']
-                )
-                context = await browser.new_context(
-                    viewport={'width': 1920, 'height': 1080},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
-                )
-                page = await context.new_page()
-                
-                # Navigate and wait for full load
-                await page.goto(TARGET_URL, wait_until='networkidle', timeout=45000)
-                await page.wait_for_load_state('domcontentloaded')
-                await asyncio.sleep(random.uniform(2, 5))  # Human-like pause
-                
-                # Click once: example on first prominent button/link; customize selector for shy.bio/67
-                try:
-                    await page.locator('button, a, [role="button"]').first.click(timeout=10000)
-                    print(f"Clicked on {TARGET_URL} via {proxy_str}")
-                    await asyncio.sleep(random.uniform(1.5, 3.5))  # Post-click dwell
-                except:
-                    print(f"No clickable element or click failed via {proxy_str}")
-                
-                await browser.close()
-                print(f"Cycle complete for proxy {proxy_str} @ {time.strftime('%H:%M:%S')}")
-                await asyncio.sleep(random.uniform(0.5, 2.0))
-            except Exception as e:
-                print(f"Browser cycle failed for {proxy_str}: {str(e)[:100]}")
-                continue
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(TARGET_URL, proxy=proxy_str, timeout=15) as resp:
+                        print(f"HTTP fallback {proxy_str} -> {resp.status}")
+            except:
+                pass
+        await asyncio.sleep(random.uniform(1.5, 4))
 
 async def continuous_browser_hammer():
     while True:
-        print(f"New browser hammer cycle on {TARGET_URL}")
+        print(f"🚀 New hammer cycle on {TARGET_URL} - {time.strftime('%H:%M:%S')}")
         await browser_hammer_cycle()
-        await asyncio.sleep(15)  # Cooldown between full proxy sweeps
+        await asyncio.sleep(25)
 
 @app.get("/health")
 async def health():
-    return {"status": "Browser-based auto-hammer running on https://shy.bio/67"}
+    return {"status": "Auto hammer active - check logs for clicks"}
 
-# Manual trigger remains
 @app.post("/start-spam")
 async def manual_trigger(background_tasks: BackgroundTasks):
     background_tasks.add_task(browser_hammer_cycle)
-    return JSONResponse({"status": "Manual browser hammer cycle triggered"})
+    return JSONResponse({"status": "Manual cycle queued"})
 
 if __name__ == "__main__":
     import uvicorn
